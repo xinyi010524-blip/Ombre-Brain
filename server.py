@@ -568,6 +568,27 @@ async def _related_note(bucket: dict) -> str:
     return "  ↳ 关联桶: " + ", ".join(parts) if parts else ""
 
 
+async def _ensure_related(bucket: dict) -> None:
+    """命中桶若无 related，用 embedding 相似度自动补全前3个最相似桶并写入(不覆盖已有)。
+
+    就地更新 bucket["metadata"]["related"]，使同一次 breath 调用即可展示。
+    embedding 不可用 / 无相似桶时静默跳过，不影响检索返回。
+    """
+    meta = bucket.get("metadata", {})
+    if meta.get("related"):
+        return
+    try:
+        similar = await embedding_engine.find_similar_buckets(bucket["id"], top_k=3, min_sim=0.5)
+        if not similar:
+            return
+        related_ids = [bid for bid, _ in similar]
+        ok = await bucket_mgr.set_related(bucket["id"], related_ids, overwrite=False)
+        if ok:
+            meta["related"] = related_ids  # 就地反映，供本次 _related_note 使用
+    except Exception as e:
+        logger.warning(f"Auto-link related failed / 自动关联失败 {bucket.get('id', '?')}: {e}")
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -853,6 +874,8 @@ async def breath(
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
             # --- D3: append related-bucket note (id + name, no full content) ---
             # --- 命中桶若有 related 关联，附一行关联桶 id+名称，不展开全文 ---
+            # 无 related 时用 embedding 相似度自动补全前3个（已有不覆盖）
+            await _ensure_related(bucket)
             rel_note = await _related_note(bucket)
             if rel_note:
                 summary = summary + "\n" + rel_note

@@ -309,6 +309,49 @@ class BucketManager:
         return True
 
     # ---------------------------------------------------------
+    # Set 'related' field WITHOUT bumping last_active
+    # 写入 related 关联字段，但不刷新激活时间
+    #
+    # Auto-linking (embedding similarity) must not reset a bucket's
+    # update timestamp / decay timer just because it was searched.
+    # 自动关联（embedding 相似度）不应仅因被检索就重置桶的更新时间/衰减计时。
+    # ---------------------------------------------------------
+    async def set_related(self, bucket_id: str, related_ids: list[str], overwrite: bool = False) -> bool:
+        """
+        Write the 'related' frontmatter field (list of bucket ids).
+        写入 related 元字段（关联桶 id 列表）。
+
+        overwrite=False: skip if the bucket already has a non-empty 'related'.
+        overwrite=False 时，已有非空 related 的桶不覆盖。
+        Does NOT touch last_active / 不修改 last_active。
+        """
+        file_path = self._find_bucket_file(bucket_id)
+        if not file_path:
+            return False
+        try:
+            post = frontmatter.load(file_path)
+        except Exception as e:
+            logger.warning(f"Failed to load bucket for set_related / 加载桶失败: {file_path}: {e}")
+            return False
+
+        if not overwrite and post.get("related"):
+            return False
+
+        cleaned = [str(r).strip() for r in related_ids if str(r).strip() and str(r).strip() != bucket_id]
+        if not cleaned:
+            return False
+        post["related"] = cleaned
+
+        try:
+            with open(file_path, "w", encoding="utf-8") as f:
+                f.write(frontmatter.dumps(post))
+        except OSError as e:
+            logger.error(f"Failed to write set_related / 写入 related 失败: {file_path}: {e}")
+            return False
+        logger.info(f"Auto-linked related for bucket / 自动写入关联: {bucket_id} -> {cleaned}")
+        return True
+
+    # ---------------------------------------------------------
     # Wikilink injection — DISABLED
     # 自动添加 Obsidian 双链 — 已禁用
     # Now handled by LLM prompts (Gemini adds [[]] for proper nouns)
