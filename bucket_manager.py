@@ -550,27 +550,71 @@ class BucketManager:
         """
         Calculate text dimension relevance score (0~1).
         计算文本维度的相关性得分。
+
+        D1 优先级分层（高 -> 低）：
+          1. 关键词字段(keywords/tags)与桶名的「精确 / 整词命中」—— 权重最高
+          2. 整段 query 出现在「正文/摘要」中 —— 次高
+          3. rapidfuzz 模糊匹配 —— 最低
+        （语义模糊匹配在 breath 层以向量通道追加，整体最低于以上三档。）
+
+        中文短关键词（如两字人名）按「整体包含」判定，不按字符拆散，
+        避免 "婷易" 被拆成 "婷"/"易" 分别命中不相关桶。
         """
         meta = bucket.get("metadata", {})
+        q = (query or "").strip().lower()
+        if not q:
+            return 0.0
 
-        name_score = fuzz.partial_ratio(query, meta.get("name", "")) * 3
+        name = str(meta.get("name", ""))
+        # 关键词字段：tags + 可选 keywords 元字段（均作为精确匹配关键词）
+        keyword_fields = [
+            str(k) for k in (list(meta.get("tags", [])) + list(meta.get("keywords", [])))
+            if str(k).strip()
+        ]
+        domains = [str(d) for d in meta.get("domain", []) if str(d).strip()]
+        content = (bucket.get("content", "") or "")[:1000]
+
+        # --- Base layer (tier 3): original fuzzy multi-channel, preserves recall ---
+        # --- 基础层（第3档）：保留原模糊多通道，确保召回不退化 ---
+        name_score = fuzz.partial_ratio(q, name.lower()) * 3
         domain_score = (
-            max(
-                (fuzz.partial_ratio(query, d) for d in meta.get("domain", [])),
-                default=0,
-            )
-            * 2.5
+            max((fuzz.partial_ratio(q, d.lower()) for d in domains), default=0) * 2.5
         )
         tag_score = (
-            max(
-                (fuzz.partial_ratio(query, tag) for tag in meta.get("tags", [])),
-                default=0,
-            )
-            * 2
+            max((fuzz.partial_ratio(q, kw.lower()) for kw in keyword_fields), default=0) * 2
         )
-        content_score = fuzz.partial_ratio(query, bucket.get("content", "")[:1000]) * self.content_weight
+        content_score = fuzz.partial_ratio(q, content.lower()) * self.content_weight
+        base = (name_score + domain_score + tag_score + content_score) / (
+            100 * (3 + 2.5 + 2 + self.content_weight)
+        )
 
-        return (name_score + domain_score + tag_score + content_score) / (100 * (3 + 2.5 + 2 + self.content_weight))
+        # --- Whole-unit match helper: exact or contiguous containment (no char split) ---
+        # --- 整词命中：完全相等或整体包含，绝不拆字符（中文短关键词安全）---
+        def _whole_match(target: str) -> float:
+            t = target.strip().lower()
+            if not t:
+                return 0.0
+            if q == t:
+                return 1.0
+            if q in t or t in q:
+                return 0.85
+            return 0.0
+
+        # --- Tier 1 bonus: exact/whole-keyword hit on keywords/tags/name (highest) ---
+        keyword_exact = max(
+            (_whole_match(kw) for kw in keyword_fields), default=0.0
+        )
+        name_exact = _whole_match(name)
+        domain_exact = max((_whole_match(d) for d in domains), default=0.0) * 0.9
+        tier1 = max(keyword_exact, name_exact, domain_exact)
+
+        # --- Tier 2 bonus: whole query appears verbatim in content/summary (second) ---
+        tier2 = 1.0 if q in content.lower() else 0.0
+
+        # Additive bonuses keep tier1 >> tier2 >> base(fuzzy); cap at 1.0.
+        # 叠加奖励：精确关键词(+0.6) 优先于 正文整段命中(+0.3) 优先于 纯模糊(base)。
+        score = base + tier1 * 0.6 + tier2 * 0.3
+        return min(1.0, score)
 
     # ---------------------------------------------------------
     # Emotion resonance sub-score:
