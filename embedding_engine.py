@@ -177,6 +177,40 @@ class EmbeddingEngine:
         results.sort(key=lambda x: x[1], reverse=True)
         return results[:top_k]
 
+    async def find_similar_buckets(
+        self, bucket_id: str, top_k: int = 3, min_sim: float = 0.5
+    ) -> list[tuple[str, float]]:
+        """
+        Find buckets most similar to an existing bucket's stored embedding.
+        基于已存储的 embedding，找出与某个桶最相似的若干桶（排除自身）。
+        Returns (bucket_id, similarity) sorted desc; empty if unavailable.
+        """
+        if not self.enabled:
+            return []
+
+        target = await self.get_embedding(bucket_id)
+        if not target:
+            return []
+
+        conn = sqlite3.connect(self.db_path)
+        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        conn.close()
+
+        results = []
+        for other_id, emb_json in rows:
+            if other_id == bucket_id:
+                continue
+            try:
+                other = json.loads(emb_json)
+                sim = self._cosine_similarity(target, other)
+                if sim >= min_sim:
+                    results.append((other_id, sim))
+            except (json.JSONDecodeError, Exception):
+                continue
+
+        results.sort(key=lambda x: x[1], reverse=True)
+        return results[:top_k]
+
     @staticmethod
     def _cosine_similarity(a: list[float], b: list[float]) -> float:
         """Calculate cosine similarity between two vectors."""

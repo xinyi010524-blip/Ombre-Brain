@@ -516,6 +516,79 @@ def _summary_line(b: dict, prefix: str = "") -> str:
     )
 
 
+def _passes_date_filter(meta: dict, date_from: str, date_to: str) -> bool:
+    """按桶更新时间(last_active,回退 created)过滤。date_from/date_to 为 YYYY-MM-DD，闭区间。
+
+    无任何日期参数 → 全部通过；桶无时间戳 → 不排除（保守保留）。
+    """
+    if not date_from and not date_to:
+        return True
+    ts = str(meta.get("last_active", meta.get("created", "")))[:10]  # 取 YYYY-MM-DD
+    if not ts:
+        return True
+    if date_from and ts < date_from:
+        return False
+    if date_to and ts > date_to:
+        return False
+    return True
+
+
+async def _related_note(bucket: dict) -> str:
+    """D3：若桶存在 related 关联，返回一行关联桶 id+名称的注脚（不展开全文）。
+
+    related 元字段兼容多种格式：逗号分隔字符串、id 列表、或 {id,name} 字典列表。
+    无 related 时返回空串。
+    """
+    meta = bucket.get("metadata", {})
+    related = meta.get("related") or []
+    if isinstance(related, str):
+        related = [r.strip() for r in related.split(",") if r.strip()]
+    if not isinstance(related, (list, tuple)) or not related:
+        return ""
+
+    parts = []
+    for r in related:
+        if isinstance(r, dict):
+            rid = str(r.get("id", "")).strip()
+            rname = str(r.get("name", "")).strip()
+        else:
+            rid = str(r).strip()
+            rname = ""
+        if not rid:
+            continue
+        if not rname:
+            try:
+                rb = await bucket_mgr.get(rid)
+                if rb:
+                    rname = rb["metadata"].get("name", rid)
+            except Exception:
+                rname = ""
+        parts.append(f"{rname}({rid})" if rname else rid)
+
+    return "  ↳ 关联桶: " + ", ".join(parts) if parts else ""
+
+
+async def _ensure_related(bucket: dict) -> None:
+    """命中桶若无 related，用 embedding 相似度自动补全前3个最相似桶并写入(不覆盖已有)。
+
+    就地更新 bucket["metadata"]["related"]，使同一次 breath 调用即可展示。
+    embedding 不可用 / 无相似桶时静默跳过，不影响检索返回。
+    """
+    meta = bucket.get("metadata", {})
+    if meta.get("related"):
+        return
+    try:
+        similar = await embedding_engine.find_similar_buckets(bucket["id"], top_k=3, min_sim=0.5)
+        if not similar:
+            return
+        related_ids = [bid for bid, _ in similar]
+        ok = await bucket_mgr.set_related(bucket["id"], related_ids, overwrite=False)
+        if ok:
+            meta["related"] = related_ids  # 就地反映，供本次 _related_note 使用
+    except Exception as e:
+        logger.warning(f"Auto-link related failed / 自动关联失败 {bucket.get('id', '?')}: {e}")
+
+
 # =============================================================
 # Tool 1: breath — Breathe
 # 工具 1：breath — 呼吸
@@ -535,14 +608,18 @@ async def breath(
     max_results: int = 5,
     importance_min: int = -1,
     mode: str = "summary",
+    date_from: str = "",
+    date_to: str = "",
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。"""
     await decay_engine.ensure_started()
     max_results = min(max_results, 50)
     mode = (mode or "summary").strip().lower()
     if mode not in ("summary", "full"):
         mode = "summary"
     max_tokens = min(max_tokens, 20000)
+    date_from = (date_from or "").strip()
+    date_to = (date_to or "").strip()
 
     # --- importance_min mode: bulk fetch by importance threshold ---
     # --- 重要度批量拉取模式：跳过语义搜索，按 importance 降序返回 ---
@@ -555,6 +632,7 @@ async def breath(
             b for b in all_buckets
             if int(b["metadata"].get("importance", 0)) >= importance_min
             and b["metadata"].get("type") not in ("feel",)
+            and _passes_date_filter(b["metadata"], date_from, date_to)
         ]
         filtered.sort(key=lambda b: int(b["metadata"].get("importance", 0)), reverse=True)
         filtered = filtered[:20]
@@ -614,6 +692,7 @@ async def breath(
             and b["metadata"].get("type") not in ("permanent", "feel")
             and not b["metadata"].get("pinned", False)
             and not b["metadata"].get("protected", False)
+            and _passes_date_filter(b["metadata"], date_from, date_to)
         ]
 
         logger.info(
@@ -759,6 +838,11 @@ async def breath(
     except Exception as e:
         logger.warning(f"Vector search failed, using keyword only / 向量搜索失败: {e}")
 
+    # --- D2: filter by bucket update time (combines with all other params) ---
+    # --- 按桶更新时间过滤（可与其他参数组合）---
+    if date_from or date_to:
+        matches = [b for b in matches if _passes_date_filter(b["metadata"], date_from, date_to)]
+
     # --- B4: sort by relevance, cap to max_results, note the overflow ---
     # --- 按相关性排序，只返回前 max_results 个，超出部分末尾附注 ---
     matches.sort(key=lambda b: b.get("score", 0), reverse=True)
@@ -788,6 +872,13 @@ async def breath(
                 summary = f"[语义关联] [bucket_id:{bucket['id']}] {summary}"
             else:
                 summary = f"[bucket_id:{bucket['id']}] {summary}"
+            # --- D3: append related-bucket note (id + name, no full content) ---
+            # --- 命中桶若有 related 关联，附一行关联桶 id+名称，不展开全文 ---
+            # 无 related 时用 embedding 相似度自动补全前3个（已有不覆盖）
+            await _ensure_related(bucket)
+            rel_note = await _related_note(bucket)
+            if rel_note:
+                summary = summary + "\n" + rel_note
             results.append(summary)
             token_used += summary_tokens
             displayed += 1
