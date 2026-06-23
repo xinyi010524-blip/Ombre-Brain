@@ -2,10 +2,11 @@
 # Module: Embedding Engine (embedding_engine.py)
 # 模块：向量化引擎
 #
-# Generates embeddings via Gemini API (OpenAI-compatible),
-# stores them in SQLite, and provides cosine similarity search.
-# 通过 Gemini API（OpenAI 兼容）生成 embedding，
-# 存储在 SQLite 中，提供余弦相似度搜索。
+# Generates embeddings via Gemini API (Google native by default,
+# OpenAI-compatible for custom endpoints), stores them in SQLite,
+# and provides cosine similarity search.
+# 通过 Gemini API（默认 Google 原生接口，自定义端点走 OpenAI 兼容）
+# 生成 embedding，存储在 SQLite 中，提供余弦相似度搜索。
 #
 # Depended on by: server.py, bucket_manager.py
 # 被谁依赖：server.py, bucket_manager.py
@@ -17,14 +18,24 @@ import math
 import sqlite3
 import logging
 
-from openai import AsyncOpenAI
+import httpx
+
+# Optional: keep openai import for users who explicitly set a non-Google base_url
+try:
+    from openai import AsyncOpenAI
+except ImportError:
+    AsyncOpenAI = None
 
 logger = logging.getLogger("ombre_brain.embedding")
+
+# Google's native embedding endpoint (default)
+_GOOGLE_NATIVE_BASE = "https://generativelanguage.googleapis.com/v1beta"
 
 
 class EmbeddingEngine:
     """
     Embedding generation + SQLite vector storage + cosine search.
+    Supports both Google native API (default) and OpenAI-compatible endpoints.
     向量生成 + SQLite 向量存储 + 余弦搜索。
     """
 
@@ -32,28 +43,48 @@ class EmbeddingEngine:
         dehy_cfg = config.get("dehydration", {})
         embed_cfg = config.get("embedding", {})
 
-        self.api_key = (embed_cfg.get("api_key") or dehy_cfg.get("api_key") or "").strip()
-        self.base_url = (
+        if embed_cfg.get("independent"):
+            self.api_key = str(embed_cfg.get("api_key") or "").strip()
+        else:
+            self.api_key = (
+                embed_cfg.get("api_key") or dehy_cfg.get("api_key") or ""
+            ).strip()
+
+        # Determine base_url and mode
+        user_base_url = (
             (embed_cfg.get("base_url") or "").strip()
             or (dehy_cfg.get("base_url") or "").strip()
-            or "https://generativelanguage.googleapis.com/v1beta/openai/"
         )
+
+        # If user set a custom base_url that is NOT Google's, use OpenAI-compatible mode
+        if user_base_url and "generativelanguage.googleapis.com" not in user_base_url:
+            self.mode = "openai_compat"
+            self.base_url = user_base_url
+        else:
+            self.mode = "google_native"
+            self.base_url = _GOOGLE_NATIVE_BASE
+
         self.model = embed_cfg.get("model", "gemini-embedding-001")
         self.enabled = bool(self.api_key) and embed_cfg.get("enabled", True)
+        self.last_error = ""
+        self.last_error_details = {}
 
         # --- SQLite path: buckets_dir/embeddings.db ---
         db_path = os.path.join(config["buckets_dir"], "embeddings.db")
         self.db_path = db_path
 
-        # --- Initialize client ---
-        if self.enabled:
-            self.client = AsyncOpenAI(
-                api_key=self.api_key,
-                base_url=self.base_url,
-                timeout=30.0,
-            )
-        else:
-            self.client = None
+        # --- Initialize client (only for OpenAI-compat mode) ---
+        self.client = None
+        if self.enabled and self.mode == "openai_compat":
+            if AsyncOpenAI is not None:
+                self.client = AsyncOpenAI(
+                    api_key=self.api_key,
+                    base_url=self.base_url,
+                    timeout=30.0,
+                )
+            else:
+                logger.warning("openai package not installed; falling back to google_native mode")
+                self.mode = "google_native"
 
         # --- Initialize SQLite ---
         self._init_db()
@@ -66,9 +97,17 @@ class EmbeddingEngine:
             CREATE TABLE IF NOT EXISTS embeddings (
                 bucket_id TEXT PRIMARY KEY,
                 embedding TEXT NOT NULL,
+                model TEXT NOT NULL DEFAULT '',
                 updated_at TEXT NOT NULL
             )
         """)
+        columns = {
+            row[1] for row in conn.execute("PRAGMA table_info(embeddings)").fetchall()
+        }
+        if "model" not in columns:
+            conn.execute(
+                "ALTER TABLE embeddings ADD COLUMN model TEXT NOT NULL DEFAULT ''"
+            )
         conn.commit()
         conn.close()
 
@@ -86,34 +125,93 @@ class EmbeddingEngine:
             if not embedding:
                 return False
             self._store_embedding(bucket_id, embedding)
+            self.last_error = ""
+            self.last_error_details = {}
             return True
         except Exception as e:
+            self._capture_error(e)
             logger.warning(f"Embedding generation failed for {bucket_id}: {e}")
             return False
 
     async def _generate_embedding(self, text: str) -> list[float]:
-        """Call API to generate embedding vector."""
+        """Call API to generate embedding vector. Supports both Google native and OpenAI-compat."""
         # Truncate to avoid token limits
         truncated = text[:2000]
+
+        if self.mode == "google_native":
+            return await self._generate_embedding_google_native(truncated)
+        else:
+            return await self._generate_embedding_openai_compat(truncated)
+
+    async def _generate_embedding_google_native(self, text: str) -> list[float]:
+        """Call Google's native embedding API with ?key= auth (works with all key formats)."""
+        url = f"{self.base_url}/models/{self.model}:embedContent?key={self.api_key}"
+        body = {
+            "model": f"models/{self.model}",
+            "content": {
+                "parts": [{"text": text}]
+            }
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(url, json=body)
+                if response.status_code != 200:
+                    self.last_error = f"Google API error: {response.status_code}"
+                    self.last_error_details = {
+                        "request_url": str(url).split("?")[0],  # Don't log key
+                        "status_code": response.status_code,
+                        "response_body": response.text[:2000],
+                    }
+                    logger.warning(f"Embedding API call failed: Error code: {response.status_code} - {response.text[:200]}")
+                    return []
+                data = response.json()
+                values = data.get("embedding", {}).get("values", [])
+                return values
+        except Exception as e:
+            self._capture_error(e)
+            logger.warning(f"Embedding API call failed: {e}")
+            return []
+
+    async def _generate_embedding_openai_compat(self, text: str) -> list[float]:
+        """Call OpenAI-compatible embedding API (for non-Google providers)."""
         try:
             response = await self.client.embeddings.create(
                 model=self.model,
-                input=truncated,
+                input=text,
             )
             if response.data and len(response.data) > 0:
                 return response.data[0].embedding
             return []
         except Exception as e:
+            self._capture_error(e)
             logger.warning(f"Embedding API call failed: {e}")
             return []
+
+    def _capture_error(self, error: Exception) -> None:
+        """Keep upstream diagnostics without retaining credentials or headers."""
+        response = getattr(error, "response", None)
+        request = getattr(error, "request", None)
+        if request is None and response is not None:
+            request = getattr(response, "request", None)
+
+        self.last_error = f"{type(error).__name__}: {error}"[:500]
+        self.last_error_details = {
+            "request_url": str(getattr(request, "url", "")),
+            "status_code": getattr(response, "status_code", None),
+            "response_body": getattr(response, "text", "")[:2000],
+        }
 
     def _store_embedding(self, bucket_id: str, embedding: list[float]):
         """Store embedding in SQLite."""
         from utils import now_iso
         conn = sqlite3.connect(self.db_path)
         conn.execute(
-            "INSERT OR REPLACE INTO embeddings (bucket_id, embedding, updated_at) VALUES (?, ?, ?)",
-            (bucket_id, json.dumps(embedding), now_iso()),
+            """
+            INSERT OR REPLACE INTO embeddings
+                (bucket_id, embedding, model, updated_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (bucket_id, json.dumps(embedding), self.model, now_iso()),
         )
         conn.commit()
         conn.close()
@@ -129,7 +227,11 @@ class EmbeddingEngine:
         """Retrieve stored embedding for a bucket. Returns None if not found."""
         conn = sqlite3.connect(self.db_path)
         row = conn.execute(
-            "SELECT embedding FROM embeddings WHERE bucket_id = ?", (bucket_id,)
+            """
+            SELECT embedding FROM embeddings
+            WHERE bucket_id = ? AND model = ?
+            """,
+            (bucket_id, self.model),
         ).fetchone()
         conn.close()
         if row:
@@ -158,7 +260,10 @@ class EmbeddingEngine:
 
         # Load all embeddings from SQLite
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        rows = conn.execute(
+            "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
+            (self.model,),
+        ).fetchall()
         conn.close()
 
         if not rows:
@@ -193,7 +298,10 @@ class EmbeddingEngine:
             return []
 
         conn = sqlite3.connect(self.db_path)
-        rows = conn.execute("SELECT bucket_id, embedding FROM embeddings").fetchall()
+        rows = conn.execute(
+            "SELECT bucket_id, embedding FROM embeddings WHERE model = ?",
+            (self.model,),
+        ).fetchall()
         conn.close()
 
         results = []
