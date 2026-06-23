@@ -29,6 +29,41 @@ async def backfill(batch_size: int = 20, dry_run: bool = False):
         print("ERROR: Embedding engine not enabled (missing API key?)")
         return
 
+    # --- Preflight: show resolved embedding config (key masked) ---
+    # --- 预检：打印解析后的 embedding 配置（密钥脱敏）---
+    key = engine.api_key or ""
+    masked = f"{key[:4]}...{key[-4:]}" if len(key) > 8 else ("***" if key else "(none)")
+    print("=== Embedding preflight / 预检 ===")
+    print(f"  model    : {engine.model}")
+    print(f"  base_url : {engine.base_url}")
+    print(f"  api_key  : {masked}")
+    print(f"  db_path  : {engine.db_path}")
+
+    # --- Preflight: one live test call so a misconfig fails fast with a clear msg ---
+    # --- 预检：先做一次真实 embedding 调用，配置错误时立即失败、给出明确提示 ---
+    if not dry_run:
+        print("  test call ... ", end="", flush=True)
+        try:
+            vec = await engine._generate_embedding("preflight connectivity test")
+        except Exception as e:
+            vec = None
+            print("FAILED")
+            print(f"ERROR: embedding test call raised: {e}")
+        else:
+            if vec:
+                print(f"OK (dim={len(vec)})")
+            else:
+                print("FAILED")
+        if not vec:
+            print(
+                "Aborting before backfill. Check that base_url matches the api_key's "
+                "provider and that the model name is valid for that endpoint.\n"
+                "常见原因：base_url 指向脱水用的供应商(如 DeepSeek)，但 model 是 "
+                "gemini-embedding-001 —— 二者不匹配。请设置 OMBRE_EMBEDDING_BASE_URL / "
+                "OMBRE_EMBEDDING_API_KEY 指向正确的 embedding 供应商。"
+            )
+            return
+
     all_buckets = await bucket_mgr.list_all(include_archive=True)
     print(f"Total buckets: {len(all_buckets)}")
 
