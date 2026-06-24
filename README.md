@@ -103,6 +103,10 @@ curl http://localhost:8000/health
 
 重启 Claude Desktop，你应该能在工具列表里看到 `breath`、`hold`、`grow` 等工具了。
 
+> ⚠️ **务必固定服务器名**（这里是 `ombre-brain`）。客户端把工具暴露成 `mcp__<服务器名>__breath`——名字一变，工具 ID 全变。如果你的客户端（比如 Claude Code 网页/远程环境）自动给服务器起了随机/UUID 名字，那么每次重配 OB 工具名都会漂移，导致**醒来第一口 `breath` 找不到工具**。解决：在客户端 MCP 配置里给它一个写死的名字（如 `ombre-brain`），别用自动生成名。
+>
+> 兜底：`.claude/hooks/session_breath.py` 这个 SessionStart 钩子直接走 HTTP `/breath-hook` 注入记忆，不依赖 MCP 工具发现——就算工具名漂了、还没加载，睁眼也能先看到记忆（仅在 `streamable-http` 远程模式下生效，可用 `OMBRE_HOOK_URL` 指定地址）。
+
 > **想挂载 Obsidian？** 用任意文本编辑器打开 `docker-compose.user.yml`，把 `./buckets:/data` 改成你的 Vault 路径，例如：
 > ```yaml
 > - /Users/你的用户名/Documents/Obsidian Vault/Ombre Brain:/data
@@ -701,6 +705,12 @@ When connecting via tunnel, ensure:
 **仅在远程 HTTP 模式下有效**（`OMBRE_TRANSPORT=streamable-http`）。本地 stdio 模式下 hook 会安静退出，不影响正常使用。
 
 可以通过 `OMBRE_HOOK_URL` 环境变量指定服务器地址（默认 `http://localhost:8000`），或者设置 `OMBRE_HOOK_SKIP=1` 临时禁用。
+
+钩子带连接失败重试与多地址兜底：
+- `OMBRE_HOOK_URLS` — 逗号分隔的备用地址列表，按顺序尝试（在 `OMBRE_HOOK_URL` 之后、`localhost:8000` 之前）。
+- `OMBRE_HOOK_RETRIES` — 每个地址的重试次数（默认 2，带指数退避）。
+
+整个钩子有总时间预算（约 10s，低于 `settings.json` 的 12s 超时），任何情况下都不会阻塞会话启动；全部地址不可达时静默退出。
 
 If using Claude Code, `.claude/settings.json` configures a `SessionStart` hook that auto-calls `breath` on each new or resumed session, surfacing your highest-weight unresolved memories as context. Only active in remote HTTP mode. Set `OMBRE_HOOK_SKIP=1` to disable temporarily.
 
