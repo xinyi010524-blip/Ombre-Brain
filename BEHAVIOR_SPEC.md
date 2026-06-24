@@ -44,7 +44,7 @@
 
 **OB 工具调用**：
 ```
-breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_results=20, importance_min=-1)
+breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_results=-1, importance_min=-1)
 ```
 
 **系统内部发生什么**：
@@ -56,7 +56,7 @@ breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_result
 6. **冷启动检测**：找 `activation_count==0 && importance>=8` 的桶，最多取 2 个插入排序最前（**决策：`create()` 初始化应为 0，区分"创建"与"被主动召回"，见 B-04**）
 7. 按 `decay_engine.calculate_score(metadata)` 降序排列剩余未解决桶
 8. 对 top-20 以外随机洗牌（top-1 固定，2~20 随机）
-9. 截断到 `max_results` 条
+9. 截断到生效条数：`max_results=-1`（默认）→ 浮现取前 15、搜索按相关度窗口自适应；显式传 `>=1` 则硬截断为该值（最大 50）
 10. 对每个桶调用 `dehydrator.dehydrate(strip_wikilinks(content), clean_meta)` 压缩摘要
 11. 按 `max_tokens` 预算截断输出
 

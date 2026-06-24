@@ -632,16 +632,24 @@ async def breath(
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
-    max_results: int = 5,
+    max_results: int = -1,
     importance_min: int = -1,
     mode: str = "summary",
     date_from: str = "",
     date_to: str = "",
     include_dormant: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制搜索结果返回数量(默认5,最大50;钉选桶不计入名额,超出部分末尾附注)。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
     await decay_engine.ensure_started()
-    max_results = min(max_results, 50)
+    # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
+    # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
+    auto_results = max_results is None or max_results < 1
+    if auto_results:
+        SURFACE_AUTO_CAP = 15   # 浮现模式自适应默认条数
+        REL_WINDOW = 0.6        # 搜索:保留分数 >= 最高分*0.6 的相关桶
+        AUTO_HARD_CAP = 50      # 安全上限,正常情况下 token 预算先触顶
+    else:
+        max_results = min(max_results, 50)
     mode = (mode or "summary").strip().lower()
     if mode not in ("summary", "full"):
         mode = "summary"
@@ -770,8 +778,9 @@ async def breath(
                 random.shuffle(pool)
                 non_cold = top1 + pool + non_cold[min(20, len(non_cold)):]
             candidates = cold_start + non_cold
-        # Hard cap: never surface more than max_results buckets
-        candidates = candidates[:max_results]
+        # Hard cap: never surface more than the effective cap (auto or explicit)
+        surface_cap = SURFACE_AUTO_CAP if auto_results else max_results
+        candidates = candidates[:surface_cap]
 
         dynamic_results = []
         for b in candidates:
@@ -836,10 +845,13 @@ async def breath(
     q_valence = valence if 0 <= valence <= 1 else None
     q_arousal = arousal if 0 <= arousal <= 1 else None
 
+    # Auto 模式拉宽候选池(50),避免"所有相关记忆"在排序前就被截断;
+    # 显式模式沿用旧行为(至少 20,保证相关度附注准确)
+    fetch_n = AUTO_HARD_CAP if auto_results else max(max_results, 20)
     try:
         matches = await bucket_mgr.search(
             query,
-            limit=max(max_results, 20),
+            limit=fetch_n,
             domain_filter=domain_filter,
             query_valence=q_valence,
             query_arousal=q_arousal,
@@ -856,7 +868,7 @@ async def breath(
     # --- 向量相似度通道：找到语义相关的桶 ---
     matched_ids = {b["id"] for b in matches}
     try:
-        vector_results = await embedding_engine.search_similar(query, top_k=max(max_results, 20))
+        vector_results = await embedding_engine.search_similar(query, top_k=fetch_n)
         for bucket_id, sim_score in vector_results:
             if bucket_id not in matched_ids and sim_score > 0.5:
                 bucket = await bucket_mgr.get(bucket_id)
@@ -878,11 +890,22 @@ async def breath(
     if not include_dormant:
         matches = [b for b in matches if not b["metadata"].get("dormant")]
 
-    # --- B4: sort by relevance, cap to max_results, note the overflow ---
-    # --- 按相关性排序，只返回前 max_results 个，超出部分末尾附注 ---
+    # --- B4: sort by relevance, then select ---
+    # --- 按相关性排序后选取 ---
     matches.sort(key=lambda b: b.get("score", 0), reverse=True)
+    if auto_results:
+        # 自适应:保留分数落在最高分相对窗口内的"相关集",弱相关长尾自动丢弃。
+        # 真正的天花板是 token 预算(下方循环),AUTO_HARD_CAP 仅作安全上限。
+        if matches:
+            top_score = matches[0].get("score", 0)
+            floor = max(bucket_mgr.fuzzy_threshold, top_score * REL_WINDOW)
+            matches = [b for b in matches if b.get("score", 0) >= floor]
+        matches = matches[:AUTO_HARD_CAP]
+    else:
+        # 显式 max_results:按该值硬截断(向后兼容)
+        matches = matches[:max_results]
+    # total_relevant = 相关集大小;循环中若因 token 预算未能全展示,末尾附注
     total_relevant = len(matches)
-    matches = matches[:max_results]
 
     results = []
     token_used = 0
@@ -950,7 +973,8 @@ async def breath(
     # --- B4: overflow note at the very end / 末尾附注超出名额的相关桶 ---
     not_shown = total_relevant - displayed
     if not_shown > 0:
-        results.append(f"…还有 {not_shown} 个相关桶未显示（可增大 max_results 查看）")
+        hint = "可增大 max_tokens 查看" if auto_results else "可增大 max_results 查看"
+        results.append(f"…还有 {not_shown} 个相关桶未显示（{hint}）")
 
     final_text = "\n---\n".join(results)
     await _fire_webhook("breath", {"mode": "ok", "matches": len(matches), "chars": len(final_text)})

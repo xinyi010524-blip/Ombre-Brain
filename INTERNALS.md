@@ -271,7 +271,8 @@
 |---|---|---|
 | `10000` | `server.py` breath 默认 max_tokens | 浮现/搜索 token 预算 |
 | `20000` | `server.py` breath 上限 | max_tokens 硬上限 |
-| `50` / `20` | `server.py` breath | max_results 上限 / 默认值 |
+| `-1` / `50` | `server.py` breath | max_results 默认值(-1=自适应) / 显式硬截断上限 |
+| `0.6` / `15` / `50` | `server.py` breath 自适应 | 搜索相关度窗口比例 / 浮现默认条数 / 安全上限 |
 | `3000` | `dehydrator.py` dehydrate | API 脱水内容截断 |
 | `2000` | `dehydrator.py` merge | API 合并内容各截断 |
 | `5000` | `dehydrator.py` digest | API 日记整理内容截断 |
