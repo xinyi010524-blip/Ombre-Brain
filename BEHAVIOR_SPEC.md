@@ -44,7 +44,7 @@
 
 **OB 工具调用**：
 ```
-breath(query="", max_tokens=10000, domain="", valence=-1, arousal=-1, max_results=-1, importance_min=-1)
+breath(query="", max_tokens=-1, domain="", valence=-1, arousal=-1, max_results=-1, importance_min=-1)
 ```
 
 **系统内部发生什么**：
