@@ -628,7 +628,7 @@ def _extract_todos(bucket: dict) -> list[str]:
 @mcp.tool()
 async def breath(
     query: str = "",
-    max_tokens: int = 10000,
+    max_tokens: int = -1,
     domain: str = "",
     valence: float = -1,
     arousal: float = -1,
@@ -639,7 +639,7 @@ async def breath(
     date_to: str = "",
     include_dormant: bool = False,
 ) -> str:
-    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限(默认10000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
+    """检索/浮现记忆。不传query或传空=自动浮现,有query=关键词检索。max_tokens控制返回总token上限:默认-1=按模式自动(自适应检索5000省钱,浮现及其它10000);显式传则按值(上限20000)。domain逗号分隔,valence/arousal 0~1(-1忽略)。max_results控制返回数量:默认-1=自适应(不卡固定条数,搜索时按"与最高分的相对差距"圈定相关集,浮现时取权重前15,真正上限交给max_tokens);显式传>=1则按该值硬截断(最大50)。钉选桶不计入名额,超出部分末尾附注。importance_min>=1时按重要度批量拉取(不走语义搜索,按importance降序返回最多20条)。mode=summary(默认)浮现时每桶只返回单行摘要省token,mode=full返回脱水全文;query非空时忽略mode始终返回full。date_from/date_to(YYYY-MM-DD,可选)按桶更新时间闭区间过滤,可与其他参数组合。include_dormant=True时包含休眠桶(默认隐藏)。"""
     await decay_engine.ensure_started()
     # max_results=-1(默认)→ 自适应:相关度决定条数,token预算兜底
     # 显式传 >=1 → 按该值硬截断(向后兼容手动指定)
@@ -653,7 +653,14 @@ async def breath(
     mode = (mode or "summary").strip().lower()
     if mode not in ("summary", "full"):
         mode = "summary"
-    max_tokens = min(max_tokens, 20000)
+    # token 预算:max_tokens=-1(默认)→ 按模式给默认值;显式传则按值(上限 20000)
+    # 自适应检索默认压到 5000(省钱),浮现/其它模式仍 10000;summary 浮现本就便宜
+    auto_tokens = max_tokens is None or max_tokens < 1
+    is_search = bool((query or "").strip()) and domain.strip().lower() != "feel"
+    if auto_tokens:
+        max_tokens = 5000 if (is_search and auto_results) else 10000
+    else:
+        max_tokens = min(max_tokens, 20000)
     date_from = (date_from or "").strip()
     date_to = (date_to or "").strip()
 

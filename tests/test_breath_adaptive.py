@@ -79,3 +79,21 @@ async def test_auto_respects_token_budget(patched_server, bucket_mgr):
     out = await patched_server.breath(query="苹果", max_tokens=60)
     shown = out.count("[bucket_id:")
     assert shown < 12, f"token budget ignored, showed {shown}"
+
+
+@pytest.mark.asyncio
+async def test_auto_search_default_budget_is_cheaper(patched_server, bucket_mgr, mock_dehydrator):
+    """自适应检索默认预算(5000)应低于 10000:同一查询下默认浮现条数更少。"""
+    # 让每个桶的脱水输出足够大(~1000 token),好让预算差异体现在条数上
+    big = "内容 " * 1000
+
+    async def fat_dehydrate(content, meta=None):
+        return big
+    mock_dehydrator.dehydrate.side_effect = fat_dehydrate
+
+    await _seed_many(bucket_mgr, n=20)
+    auto = await patched_server.breath(query="苹果")                  # 默认预算 5000
+    wide = await patched_server.breath(query="苹果", max_tokens=10000)  # 显式 10000
+    n_auto = auto.count(big)
+    n_wide = wide.count(big)
+    assert n_auto < n_wide, f"default budget not cheaper: auto={n_auto} wide={n_wide}"
